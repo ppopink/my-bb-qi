@@ -5,6 +5,7 @@ import numpy as np
 import concurrent.futures
 from difflib import SequenceMatcher
 from datetime import datetime
+import time  # 新增 time 库用于重试等待
 
 # ==========================================
 # 核心逻辑：序列相似度匹配
@@ -22,17 +23,16 @@ def calculate_seq_similarity(target_seq, stock_seq):
     return match.size / len(target_seq)
 
 # ==========================================
-# 单只股票处理任务 (已修改：接收 period 参数)
+# 单只股票处理任务
 # ==========================================
 def process_stock_seq(code, name, price, start_date, end_date, target_seq, k_period="daily"):
     try:
-        # 【关键修改】 period 参数由外部传入，可以是 'daily' 或 'weekly'
+        # 获取个股历史数据
         df = ak.stock_zh_a_hist(symbol=code, period=k_period, start_date=start_date, end_date=end_date, adjust="qfq")
         
         if df.empty: return None
         
         # 转换 1/0 序列 (红=1, 绿=0)
-        # 这里把 平盘(十字星) 归为 1。如果你觉得十字星算绿，把 >= 改为 >
         df['sign'] = np.where(df['收盘'] >= df['开盘'], '1', '0')
         
         stock_seq_str = "".join(df['sign'].tolist())
@@ -64,9 +64,24 @@ def run_manual_scan(target_seq, start_date, end_date, price_range=None, k_period
     period_name = "周线" if k_period == "weekly" else "日线"
     status.info(f"1/2 获取全市场股票名单 (当前模式: {period_name})...")
     
+    df_all = pd.DataFrame()
+    
+    # 【优化 1】增加列表获取的重试机制
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            df_all = ak.stock_zh_a_spot_em()
+            break  # 成功则跳出循环
+        except Exception as e:
+            if attempt < max_retries - 1:
+                st.warning(f"连接不稳定，正在进行第 {attempt + 1} 次重试...")
+                time.sleep(2)  # 等待2秒再重试
+            else:
+                st.error(f"列表获取失败 (已重试3次): {e}")
+                st.error("建议：请稍后再试，或检查网络连接。")
+                return []
+
     try:
-        df_all = ak.stock_zh_a_spot_em()
-        
         if price_range:
             min_p, max_p = price_range
             df_all = df_all[(df_all['最新价'] >= min_p) & (df_all['最新价'] <= max_p)]
@@ -75,13 +90,13 @@ def run_manual_scan(target_seq, start_date, end_date, price_range=None, k_period
             df_all = df_all[df_all['最新价'] > 0]
             st.warning(f"⚠️ 全市场扫描 **{len(df_all)}** 只股票...")
             
-        # 强制加入嫌疑目标
+        # 强制加入嫌疑目标 (用于测试)
         suspect = df_all[df_all['代码'] == '002115']
         if not suspect.empty:
              df_all = pd.concat([df_all, suspect]).drop_duplicates(subset=['代码'])
 
     except Exception as e:
-        st.error(f"列表获取失败: {e}")
+        st.error(f"数据处理出错: {e}")
         return []
 
     status.info(f"2/2 正在进行序列比对 ({start_date}-{end_date})...")
@@ -89,13 +104,15 @@ def run_manual_scan(target_seq, start_date, end_date, price_range=None, k_period
     results = []
     tasks = []
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+    # 【优化 2】降低并发数，防止被服务器断开连接
+    # max_workers 从 20 降低到 5，虽然慢一点，但更稳定
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         for _, row in df_all.iterrows():
             tasks.append(
                 executor.submit(
                     process_stock_seq, 
                     row['代码'], row['名称'], row['最新价'], 
-                    start_date, end_date, target_seq, k_period # 传入周期
+                    start_date, end_date, target_seq, k_period 
                 )
             )
             
@@ -104,7 +121,9 @@ def run_manual_scan(target_seq, start_date, end_date, price_range=None, k_period
             res = future.result()
             if res:
                 results.append(res)
-            if i % 50 == 0: bar.progress((i+1)/total)
+            # 更新进度条
+            if i % 10 == 0: 
+                bar.progress((i+1)/total)
             
     bar.progress(1.0)
     status.success("扫描完成！")
@@ -126,21 +145,19 @@ col1, col2 = st.columns([2, 1])
 with col1:
     user_seq = st.text_area("在此输入红绿序列 (红=1, 绿=0)", value=default_seq, height=150)
     
-    # 【新增功能】周期选择
     st.write("---")
     st.subheader("⚙️ 周期设置")
     period_option = st.radio("请选择 K 线周期", ["日线 (Daily)", "周线 (Weekly)"], horizontal=True)
     
-    # 将中文选项转换为 Akshare 接受的参数
     api_period = "weekly" if "周线" in period_option else "daily"
 
 with col2:
+    # 默认日期稍微调整一下，确保有数据
     s_date = st.text_input("开始日期 (YYYYMMDD)", value="20250910")
     e_date = st.text_input("结束日期 (YYYYMMDD)", value="20251218")
     
-    # 如果选择了周线，给出一个提示
     if api_period == "weekly":
-        st.info("⚠️ **注意**：您选择了【周线】模式。\n\n请确保您的【日期范围】足够长。\n例如：60个字符的序列在日线模式下是3个月，但在周线模式下代表 **1年零2个月** 的走势。")
+        st.info("⚠️ **注意**：周线模式下，请确保【日期范围】足够长。")
     
     st.write("---")
     use_price = st.checkbox("启用价格过滤 (提速)", value=True)
@@ -150,7 +167,7 @@ with col2:
 if st.button("🚀 开始全市场 DNA 匹配", type="primary"):
     clean_seq = user_seq.strip().replace("\n", "").replace(" ", "")
     
-    if len(clean_seq) < 5: # 周线可能序列较短，放宽限制
+    if len(clean_seq) < 5: 
         st.error("序列太短。")
     else:
         p_range = (min_p, max_p) if use_price else None
@@ -168,7 +185,6 @@ if st.button("🚀 开始全市场 DNA 匹配", type="primary"):
                 st.text(f"目标: {clean_seq}")
                 st.text(f"实际: {m['股票实际序列']}")
                 
-                # 差异高亮
                 if len(clean_seq) == len(m['股票实际序列']):
                     diff_view = "".join([c1 if c1==c2 else "X" for c1, c2 in zip(clean_seq, m['股票实际序列'])])
                     st.text(f"差异: {diff_view}")
@@ -176,4 +192,5 @@ if st.button("🚀 开始全市场 DNA 匹配", type="primary"):
                 st.markdown(f"[查看详情](http://quote.eastmoney.com/{'sh' if m['代码'].startswith('6') else 'sz'}{m['代码']}.html)")
                 st.divider()
         else:
-            st.error("未找到匹配股票。请检查日期范围是否覆盖了足够的K线数量。")
+            if not st.session_state.get('error_shown'): # 避免重复显示错误
+                st.error("未找到匹配股票。请检查日期范围是否覆盖了足够的K线数量，或尝试放宽筛选条件。")
