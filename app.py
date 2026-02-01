@@ -1,155 +1,179 @@
 import streamlit as st
-import requests
-import json
-import re
-import time
 import pandas as pd
+import akshare as ak
+import numpy as np
+import concurrent.futures
+from difflib import SequenceMatcher
+from datetime import datetime
 
-# ================= 1. 页面配置 =================
-st.set_page_config(
-    page_title="个人专属基金看板",
-    page_icon="💰",
-    layout="wide"
-)
+# ==========================================
+# 核心逻辑：序列相似度匹配
+# ==========================================
+def calculate_seq_similarity(target_seq, stock_seq):
+    # 长度校验：如果获取的数据长度连目标的 80% 都不到，说明停牌太久或数据不足，直接放弃
+    if len(stock_seq) < len(target_seq) * 0.8:
+        return 0.0
+    
+    # 寻找最长公共子序列
+    matcher = SequenceMatcher(None, target_seq, stock_seq, autojunk=False)
+    match = matcher.find_longest_match(0, len(target_seq), 0, len(stock_seq))
+    
+    # 返回匹配比例
+    return match.size / len(target_seq)
 
-# ================= 2. 核心数据获取 (直连版) =================
-def get_fund_realtime_data(code):
-    timestamp = int(time.time() * 1000)
-    url = f"http://fundgz.1234567.com.cn/js/{code}.js?rt={timestamp}"
+# ==========================================
+# 单只股票处理任务 (已修改：接收 period 参数)
+# ==========================================
+def process_stock_seq(code, name, price, start_date, end_date, target_seq, k_period="daily"):
+    try:
+        # 【关键修改】 period 参数由外部传入，可以是 'daily' 或 'weekly'
+        df = ak.stock_zh_a_hist(symbol=code, period=k_period, start_date=start_date, end_date=end_date, adjust="qfq")
+        
+        if df.empty: return None
+        
+        # 转换 1/0 序列 (红=1, 绿=0)
+        # 这里把 平盘(十字星) 归为 1。如果你觉得十字星算绿，把 >= 改为 >
+        df['sign'] = np.where(df['收盘'] >= df['开盘'], '1', '0')
+        
+        stock_seq_str = "".join(df['sign'].tolist())
+        
+        # 计算相似度
+        score = calculate_seq_similarity(target_seq, stock_seq_str)
+        
+        if score > 0.85: # 相似度阈值
+            return {
+                '代码': code,
+                '名称': name,
+                '当前价': price,
+                '匹配度': score,
+                '股票实际序列': stock_seq_str
+            }
+        return None
+        
+    except Exception:
+        return None
+
+# ==========================================
+# 主控制程序
+# ==========================================
+def run_manual_scan(target_seq, start_date, end_date, price_range=None, k_period="daily"):
+    status = st.empty()
+    bar = st.progress(0)
+    
+    # 显示当前正在搜索的模式
+    period_name = "周线" if k_period == "weekly" else "日线"
+    status.info(f"1/2 获取全市场股票名单 (当前模式: {period_name})...")
     
     try:
-        response = requests.get(url, timeout=2)
-        if response.status_code == 200:
-            match = re.search(r'jsonpgz\((.*?)\);', response.text)
-            if match:
-                return json.loads(match.group(1))
-    except:
-        pass
-    return None
-
-# ================= 3. 侧边栏：持仓配置 =================
-with st.sidebar:
-    st.header("📝 持仓配置")
-    
-    # --- 修改点提示 ---
-    st.info("格式：基金代码, 当前持有金额 (每行一个)")
-    st.caption("提示：请输入昨晚更新后的【最新市值】或你的【本金】，系统将基于此金额计算今日盈亏。")
-    
-    # 默认值 (改为金额示例)
-    default_input = """110011, 10000
-005827, 20000
-000001, 5000"""
-    
-    user_input = st.text_area("在此输入", value=default_input, height=250)
-    
-    # 刷新按钮
-    if st.button("🔄 刷新数据", type="primary"):
-        st.rerun()
-
-# ================= 4. 主界面逻辑 =================
-
-st.title("📈 个人专属基金看板")
-st.caption("🚀 **极速版 (金额模式)**：直接输入持有金额，自动计算今日盈亏。")
-
-# --- 数据处理 ---
-holdings = []
-lines = user_input.strip().split('\n')
-for line in lines:
-    parts = line.replace('，', ',').split(',')
-    if len(parts) >= 2:
-        c = parts[0].strip()
-        # 这里把输入的第二项解析为“金额 (Amount)”
-        try:
-            a = float(parts[1].strip())
-            if c and a: holdings.append((c, a))
-        except:
-            pass
-
-results = []
-total_profit = 0      # 总预估盈亏
-total_asset = 0       # 总最新市值
-
-# 循环获取数据
-if holdings:
-    progress_bar = st.progress(0)
-    
-    for i, (code, amount) in enumerate(holdings):
-        progress_bar.progress((i + 1) / len(holdings))
-        data = get_fund_realtime_data(code)
+        df_all = ak.stock_zh_a_spot_em()
         
-        if data:
-            name = data['name']
-            gszzl = float(data['gszzl'])  # 估算涨跌幅 (例如 1.5 代表 1.5%)
-            time_str = data['gztime']     # 更新时间
-            
-            # --- 核心计算逻辑修改 ---
-            # 盈亏 = 持有金额 * (涨跌幅 / 100)
-            profit = amount * (gszzl / 100)
-            
-            # 最新市值 = 原有金额 + 今日盈亏
-            # (注意：这里的 amount 如果是昨天的市值，那么 current_val 就是今天的实时市值)
-            current_val = amount + profit
-            
-            total_profit += profit
-            total_asset += current_val
-            
-            results.append({
-                "基金名称": name,
-                "代码": code,
-                "估算涨幅": gszzl,
-                "预估盈亏": profit,
-                "持有金额(昨)": amount,   # 显示原本输入的金额
-                "最新市值(今)": current_val, # 显示加上盈亏后的金额
-                "更新时间": time_str
-            })
+        if price_range:
+            min_p, max_p = price_range
+            df_all = df_all[(df_all['最新价'] >= min_p) & (df_all['最新价'] <= max_p)]
+            st.write(f"🔍 价格筛选 ({min_p}-{max_p}元): 锁定 **{len(df_all)}** 只股票")
         else:
-             results.append({
-                 "基金名称": "获取失败", "代码": code, 
-                 "估算涨幅":0, "预估盈亏":0, 
-                 "持有金额(昨)": amount, "最新市值(今)": amount, 
-                 "更新时间": "--"
-             })
+            df_all = df_all[df_all['最新价'] > 0]
+            st.warning(f"⚠️ 全市场扫描 **{len(df_all)}** 只股票...")
+            
+        # 强制加入嫌疑目标
+        suspect = df_all[df_all['代码'] == '002115']
+        if not suspect.empty:
+             df_all = pd.concat([df_all, suspect]).drop_duplicates(subset=['代码'])
 
-    progress_bar.empty()
+    except Exception as e:
+        st.error(f"列表获取失败: {e}")
+        return []
 
-# --- 界面展示 ---
+    status.info(f"2/2 正在进行序列比对 ({start_date}-{end_date})...")
+    
+    results = []
+    tasks = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        for _, row in df_all.iterrows():
+            tasks.append(
+                executor.submit(
+                    process_stock_seq, 
+                    row['代码'], row['名称'], row['最新价'], 
+                    start_date, end_date, target_seq, k_period # 传入周期
+                )
+            )
+            
+        total = len(tasks)
+        for i, future in enumerate(concurrent.futures.as_completed(tasks)):
+            res = future.result()
+            if res:
+                results.append(res)
+            if i % 50 == 0: bar.progress((i+1)/total)
+            
+    bar.progress(1.0)
+    status.success("扫描完成！")
+    
+    results.sort(key=lambda x: x['匹配度'], reverse=True)
+    return results[:10]
 
-# 1. 顶部大指标
-col1, col2 = st.columns(2)
+# ==========================================
+# 界面 UI
+# ==========================================
+st.set_page_config(page_title="DNA 序列猎手", layout="wide")
+st.title("🧬 股票 DNA 序列猎手 (日线/周线通用版)")
+
+# 默认序列
+default_seq = "110000000010011101110111110101001010110111100001100111011101011011"
+
+col1, col2 = st.columns([2, 1])
+
 with col1:
-    st.metric("今日预估总盈亏", f"{total_profit:+.2f} 元", delta=f"{total_profit:+.2f}")
+    user_seq = st.text_area("在此输入红绿序列 (红=1, 绿=0)", value=default_seq, height=150)
+    
+    # 【新增功能】周期选择
+    st.write("---")
+    st.subheader("⚙️ 周期设置")
+    period_option = st.radio("请选择 K 线周期", ["日线 (Daily)", "周线 (Weekly)"], horizontal=True)
+    
+    # 将中文选项转换为 Akshare 接受的参数
+    api_period = "weekly" if "周线" in period_option else "daily"
+
 with col2:
-    st.metric("实时持有总市值", f"{total_asset:,.2f} 元")
-
-st.divider()
-
-# 2. 详细表格
-if results:
-    df = pd.DataFrame(results)
+    s_date = st.text_input("开始日期 (YYYYMMDD)", value="20250910")
+    e_date = st.text_input("结束日期 (YYYYMMDD)", value="20251218")
     
-    # 颜色逻辑
-    def color_profit(val):
-        if val > 0: return 'color: #d62728' # 红
-        if val < 0: return 'color: #2ca02c' # 绿
-        return 'color: black'
-
-    # 渲染表格
-    st.dataframe(
-        df.style
-        .format({
-            "估算涨幅": "{:+.2f}%",
-            "预估盈亏": "{:+.2f}",
-            "持有金额(昨)": "{:,.2f}",
-            "最新市值(今)": "{:,.2f}"
-        })
-        .map(color_profit, subset=['估算涨幅', '预估盈亏']), 
-        use_container_width=True,
-        hide_index=True,
-        height=500
-    )
+    # 如果选择了周线，给出一个提示
+    if api_period == "weekly":
+        st.info("⚠️ **注意**：您选择了【周线】模式。\n\n请确保您的【日期范围】足够长。\n例如：60个字符的序列在日线模式下是3个月，但在周线模式下代表 **1年零2个月** 的走势。")
     
-    last_update = results[0]['更新时间'] if results else time.strftime('%Y-%m-%d %H:%M')
-    st.caption(f"数据更新于: {last_update}")
+    st.write("---")
+    use_price = st.checkbox("启用价格过滤 (提速)", value=True)
+    min_p = st.number_input("最低价", value=10.0)
+    max_p = st.number_input("最高价", value=15.0)
 
-else:
-    st.info("👈 请在左侧输入：基金代码, 持有金额")
+if st.button("🚀 开始全市场 DNA 匹配", type="primary"):
+    clean_seq = user_seq.strip().replace("\n", "").replace(" ", "")
+    
+    if len(clean_seq) < 5: # 周线可能序列较短，放宽限制
+        st.error("序列太短。")
+    else:
+        p_range = (min_p, max_p) if use_price else None
+        
+        matches = run_manual_scan(clean_seq, s_date, e_date, p_range, k_period=api_period)
+        
+        if matches:
+            st.balloons()
+            st.write(f"### 🏆 {period_option}序列匹配结果")
+            
+            for idx, m in enumerate(matches):
+                score = m['匹配度'] * 100
+                color = "green" if score < 90 else "red"
+                st.markdown(f"#### {idx+1}. **{m['名称']}** ({m['代码']}) - 匹配度: <span style='color:{color}'>{score:.1f}%</span>", unsafe_allow_html=True)
+                st.text(f"目标: {clean_seq}")
+                st.text(f"实际: {m['股票实际序列']}")
+                
+                # 差异高亮
+                if len(clean_seq) == len(m['股票实际序列']):
+                    diff_view = "".join([c1 if c1==c2 else "X" for c1, c2 in zip(clean_seq, m['股票实际序列'])])
+                    st.text(f"差异: {diff_view}")
+
+                st.markdown(f"[查看详情](http://quote.eastmoney.com/{'sh' if m['代码'].startswith('6') else 'sz'}{m['代码']}.html)")
+                st.divider()
+        else:
+            st.error("未找到匹配股票。请检查日期范围是否覆盖了足够的K线数量。")
